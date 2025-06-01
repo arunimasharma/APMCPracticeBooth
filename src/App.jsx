@@ -18,13 +18,67 @@ function App() {
   const [postAnonymous, setPostAnonymous] = useState(false);
   const [summaryText, setSummaryText] = useState("");
   const [searchTerm, setSearchTerm] = useState(""); // Added missing state variable
-  
+
+  const [originalTranscript, setOriginalTranscript] = useState("");
+  const [editedTranscript, setEditedTranscript] = useState("");
+  const [transcriptSegments, setTranscriptSegments] = useState([]);
+  const [showDebug, setShowDebug] = useState(false);
+  const [evaluationResults, setEvaluationResults] = useState(null);
+  const [model, setModel] = useState("gpt-4");
+
+  const transcriptCache = useRef({});
+  const speechRef = useRef(null);
+  const originalTranscriptRef = useRef("");
+
   const {
     status,
     startRecording,
     stopRecording,
     mediaBlobUrl
   } = useReactMediaRecorder({ video: true });
+
+  // setup SpeechRecognition for debug segments
+  useEffect(() => {
+    const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
+    if (SpeechRecognition) {
+      const recog = new SpeechRecognition();
+      recog.interimResults = true;
+      recog.onresult = (event) => {
+        const newSegs = [];
+        for (let i = event.resultIndex; i < event.results.length; i++) {
+          const result = event.results[i];
+          if (result.isFinal) {
+            newSegs.push({
+              text: result[0].transcript.trim(),
+              timestamp: new Date().toISOString(),
+              speaker: 'Candidate'
+            });
+          }
+        }
+        if (newSegs.length) {
+          setTranscriptSegments(prev => [...prev, ...newSegs]);
+        }
+      };
+      speechRef.current = recog;
+    }
+  }, []);
+
+  useEffect(() => {
+    if (status === 'recording') {
+      speechRef.current && speechRef.current.start();
+    } else {
+      speechRef.current && speechRef.current.stop();
+    }
+  }, [status]);
+
+  // fetch blob for transcription via Whisper when recording stops
+  useEffect(() => {
+    if (mediaBlobUrl) {
+      fetch(mediaBlobUrl)
+        .then(res => res.blob())
+        .then(blob => transcribeRecording(blob));
+    }
+  }, [mediaBlobUrl]);
 
   const handleGenerateSummary = () => {
     let summary = "";
@@ -115,6 +169,90 @@ function App() {
         ];
       }
       setQuestions(suggested);
+    }
+  };
+
+  // simple hash for caching
+  const simpleHash = (str) => {
+    let hash = 0;
+    for (let i = 0; i < str.length; i++) {
+      hash = ((hash << 5) - hash) + str.charCodeAt(i);
+      hash |= 0; // Convert to 32bit integer
+    }
+    return hash.toString();
+  };
+
+  const ruleBasedEvaluation = (text) => {
+    const criteria = ["A","B","C","D","E","F","G","H","I","J"];
+    const breakdown = {};
+    let total = 0;
+    const score = Math.min(3, Math.floor(text.split(" ").length / 50));
+    criteria.forEach(c => { breakdown[c] = score; total += score; });
+    return { totalScore: total, breakdown, summary: "Rule-based evaluation - AI service unavailable." };
+  };
+
+  const openAIKey = import.meta.env.VITE_OPENAI_KEY;
+
+  const transcribeRecording = async (blob) => {
+    try {
+      const formData = new FormData();
+      formData.append('file', blob, 'recording.webm');
+      formData.append('model', 'whisper-1');
+      formData.append('response_format', 'verbose_json');
+
+      const res = await fetch('https://api.openai.com/v1/audio/transcriptions', {
+        method: 'POST',
+        headers: { 'Authorization': `Bearer ${openAIKey}` },
+        body: formData
+      });
+      const data = await res.json();
+      const segments = (data.segments || []).map((seg, idx) => ({
+        text: seg.text.trim(),
+        timestamp: seg.start ?? idx,
+        speaker: 'Candidate'
+      }));
+      setTranscriptSegments(segments);
+      const combined = segments.map(s => s.text).join(' ');
+      setOriginalTranscript(combined);
+      setEditedTranscript(combined);
+      originalTranscriptRef.current = combined;
+    } catch (err) {
+      console.error('Whisper API failed', err);
+    }
+  };
+
+  const evaluateTranscript = async () => {
+    const transcript = editedTranscript;
+    const cacheKey = simpleHash(transcript + model);
+    if (transcriptCache.current[cacheKey]) {
+      setEvaluationResults(transcriptCache.current[cacheKey]);
+      return;
+    }
+    try {
+      const prompt = `\nYou are a Meta PM interviewer scoring a Product Sense response. Here is the transcript of the answer:\n""" \n${transcript}\n"""\nEvaluate it on the following 10 criteria:\nA. Clear assumptions\nB. Structured approach\nC. Trade-offs\nD. Clarifying questions\nE. User-centricity\nF. Strategic rationale (“Why now”)\nG. Prioritization logic\nH. Success metrics\nI. Confidence in decision-making\nJ. Summary or conclusion\nFor each item, score out of 3 (0 = not mentioned, 1 = weak, 2 = decent, 3 = excellent). Provide brief justification.\nReturn total score (out of 30), per-criterion breakdown, and feedback summary.`;
+
+      const res = await fetch('https://api.openai.com/v1/chat/completions', {
+        method: 'POST',
+        headers: {
+          'Authorization': `Bearer ${openAIKey}`,
+          'Content-Type': 'application/json'
+        },
+        body: JSON.stringify({
+          model,
+          messages: [{ role: 'user', content: prompt }],
+          temperature: 0.2
+        })
+      });
+      const data = await res.json();
+      const text = data.choices?.[0]?.message?.content || '';
+      const result = { raw: text };
+      setEvaluationResults(result);
+      transcriptCache.current[cacheKey] = result;
+    } catch (err) {
+      console.error('GPT evaluation failed', err);
+      const fallback = ruleBasedEvaluation(transcript);
+      setEvaluationResults(fallback);
+      transcriptCache.current[cacheKey] = fallback;
     }
   };
 
@@ -263,6 +401,62 @@ function App() {
                   ))}
                 </p>
               </article>
+            )}
+
+            {originalTranscript && (
+              <section>
+                <h4>Review and Edit Transcript</h4>
+                <textarea
+                  rows="6"
+                  value={editedTranscript}
+                  onChange={e => setEditedTranscript(e.target.value)}
+                ></textarea>
+                <div>
+                  <button type="button" onClick={() => setEditedTranscript(originalTranscriptRef.current)}>
+                    Reset to Original
+                  </button>
+                  <label>
+                    <input
+                      type="checkbox"
+                      checked={showDebug}
+                      onChange={e => setShowDebug(e.target.checked)}
+                    />
+                    Transcript Debug View
+                  </label>
+                </div>
+                {showDebug && (
+                  <ul>
+                    {transcriptSegments.map((seg, idx) => (
+                      <li key={idx}>[{seg.timestamp}] {seg.speaker}: {seg.text}</li>
+                    ))}
+                  </ul>
+                )}
+                <div>
+                  <label>
+                    Model:
+                    <select value={model} onChange={e => setModel(e.target.value)}>
+                      <option value="gpt-3.5-turbo">GPT-3.5</option>
+                      <option value="gpt-4">GPT-4</option>
+                    </select>
+                  </label>
+                  <button type="button" onClick={evaluateTranscript}>Evaluate Response</button>
+                </div>
+              </section>
+            )}
+
+            {evaluationResults && (
+              <section>
+                <h4>Score: {evaluationResults.totalScore ? `${evaluationResults.totalScore}/30` : 'N/A'}</h4>
+                {evaluationResults.breakdown && (
+                  <ul>
+                    {Object.entries(evaluationResults.breakdown).map(([k,v]) => (
+                      <li key={k}>{k}: {v}</li>
+                    ))}
+                  </ul>
+                )}
+                {evaluationResults.summary && <p>{evaluationResults.summary}</p>}
+                {evaluationResults.raw && <pre>{evaluationResults.raw}</pre>}
+              </section>
             )}
           </div>
         )}
