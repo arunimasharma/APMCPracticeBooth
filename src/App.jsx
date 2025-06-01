@@ -18,13 +18,99 @@ function App() {
   const [postAnonymous, setPostAnonymous] = useState(false);
   const [summaryText, setSummaryText] = useState("");
   const [searchTerm, setSearchTerm] = useState(""); // Added missing state variable
-  
+  const [transcript, setTranscript] = useState("");
+  const [recordings, setRecordings] = useState([]);
+  const recognitionRef = useRef(null);
+
+  const evaluateTranscript = (text) => {
+    const t = text.toLowerCase();
+    const has = (arr) => arr.some((w) => t.includes(w));
+    let universal = 0;
+    if (has(['assumption', 'assume'])) universal += 3;
+    if (has(['first', 'second', 'third'])) universal += 3;
+    if (has(['trade-off', 'pros', 'cons'])) universal += 3;
+    if (has(['clarify', '?'])) universal += 3;
+    if (has(['user', 'customer'])) universal += 3;
+    if (has(['why now', 'strategy'])) universal += 3;
+    if (has(['prioritize', 'priority'])) universal += 3;
+    if (has(['metric', 'measure'])) universal += 3;
+    if (has(['confident'])) universal += 3;
+    if (has(['summary', 'in conclusion'])) universal += 3;
+    return { universal };
+  };
+
+  const startSpeechRecognition = () => {
+    const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
+    if (!SpeechRecognition) return;
+    const recognition = new SpeechRecognition();
+    recognition.lang = 'en-US';
+    recognition.continuous = true;
+    recognition.interimResults = true;
+    recognition.onresult = (e) => {
+      let finalText = '';
+      for (let i = e.resultIndex; i < e.results.length; i++) {
+        if (e.results[i].isFinal) {
+          finalText += e.results[i][0].transcript + ' ';
+        }
+      }
+      if (finalText) setTranscript((prev) => (prev + finalText).trim());
+    };
+    recognitionRef.current = recognition;
+    recognition.start();
+  };
+
+  const handleStartRecording = () => {
+    setTranscript('');
+    startSpeechRecognition();
+    startRecording();
+  };
+
+  const handleStopRecording = () => {
+    if (recognitionRef.current) {
+      recognitionRef.current.stop();
+    }
+    stopRecording();
+  };
+
+  const saveRecording = async () => {
+    if (!mediaBlobUrl || !profileURL) return;
+    const res = await fetch(mediaBlobUrl);
+    const blob = await res.blob();
+    const reader = new FileReader();
+    reader.onloadend = () => {
+      const evaluation = evaluateTranscript(transcript);
+      const record = {
+        question: selectedQuestion,
+        date: Date.now(),
+        video: reader.result,
+        transcript,
+        evaluation,
+      };
+      const updated = [...recordings, record];
+      setRecordings(updated);
+      localStorage.setItem(`recordings_${profileURL}`, JSON.stringify(updated));
+    };
+    reader.readAsDataURL(blob);
+  };
+
   const {
     status,
     startRecording,
     stopRecording,
     mediaBlobUrl
   } = useReactMediaRecorder({ video: true });
+
+  useEffect(() => {
+    if (!profileURL) return;
+    const stored = JSON.parse(localStorage.getItem(`recordings_${profileURL}`) || '[]');
+    setRecordings(stored);
+  }, [profileURL]);
+
+  useEffect(() => {
+    if (status === 'stopped' && mediaBlobUrl) {
+      saveRecording();
+    }
+  }, [status, mediaBlobUrl]);
 
   const handleGenerateSummary = () => {
     let summary = "";
@@ -230,9 +316,9 @@ function App() {
             <p>❓ <em>{selectedQuestion}</em></p>
             <div>
               {status !== "recording" ? (
-                <button onClick={startRecording}>Start Recording</button>
+                <button onClick={handleStartRecording}>Start Recording</button>
               ) : (
-                <button onClick={stopRecording}>Stop Recording</button>
+                <button onClick={handleStopRecording}>Stop Recording</button>
               )}
             </div>
             {mediaBlobUrl && (
@@ -240,16 +326,19 @@ function App() {
                 <video src={mediaBlobUrl} controls></video>
                 <p><a href={mediaBlobUrl} download={`APMC_Practice_${Date.now()}.webm`}>Download Recording</a></p>
                 <label>
-                  <input 
-                    type="checkbox" 
-                    checked={postAnonymous} 
-                    onChange={e => setPostAnonymous(e.target.checked)} 
+                  <input
+                    type="checkbox"
+                    checked={postAnonymous}
+                    onChange={e => setPostAnonymous(e.target.checked)}
                   />
                   Post anonymously (do not attach my LinkedIn profile)
                 </label>
                 <button onClick={handleGenerateSummary}>
                   Generate Summary Text
                 </button>
+                {transcript && (
+                  <p><strong>Transcript:</strong> {transcript}</p>
+                )}
               </div>
             )}
             {summaryText && (
@@ -262,9 +351,25 @@ function App() {
                     </span>
                   ))}
                 </p>
+                {recordings.length > 0 && recordings[recordings.length-1].evaluation && (
+                  <p><strong>Evaluation Score:</strong> {recordings[recordings.length-1].evaluation.universal}/30</p>
+                )}
               </article>
             )}
           </div>
+        )}
+        {recordings.length > 0 && (
+          <section>
+            <h4>Your Recordings</h4>
+            {recordings.map((rec, idx) => (
+              <div key={idx}>
+                <video src={rec.video} controls width="320"></video>
+                <p><strong>Q:</strong> {rec.question}</p>
+                <p><strong>Transcript:</strong> {rec.transcript}</p>
+                <p><strong>Score:</strong> {rec.evaluation.universal}/30</p>
+              </div>
+            ))}
+          </section>
         )}
       </main>
     </>
